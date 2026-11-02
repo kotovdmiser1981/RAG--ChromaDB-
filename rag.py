@@ -26,7 +26,7 @@ class RAGAssistant:
         self, 
         embedding_store,
         api_key: Optional[str] = None,
-        model: str = "gpt-3.5-turbo",
+        model: str = "gpt-4o-mini",
         temperature: float = 0.7
     ):
         """
