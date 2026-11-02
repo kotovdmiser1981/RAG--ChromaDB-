@@ -8,11 +8,11 @@
 
 import os
 import time
+import asyncio
 import logging
-from typing import Optional
 
 from telegram import Update
-from telegram.error import TelegramError
+from telegram.error import TelegramError, NetworkError
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
@@ -31,6 +31,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+
 # Не выводим HTTP-адреса Telegram API, содержащие токен бота.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -53,8 +54,8 @@ class TelegramRAGBot:
         self.db_logger = logger
 
         # Основной HTTP-клиент Telegram API.
-        # trust_env=True явно разрешает использование настроек
-        # окружения, включая поддерживаемые HTTPX прокси.
+        # trust_env=True позволяет HTTPX использовать настройки окружения,
+        # в том числе поддерживаемые переменные прокси.
         request = HTTPXRequest(
             connection_pool_size=8,
             connect_timeout=30,
@@ -64,7 +65,7 @@ class TelegramRAGBot:
             httpx_kwargs={"trust_env": True},
         )
 
-        # Отдельный клиент для получения обновлений Telegram.
+        # Отдельный HTTP-клиент для long polling (получения обновлений).
         get_updates_request = HTTPXRequest(
             connection_pool_size=2,
             connect_timeout=30,
@@ -82,7 +83,7 @@ class TelegramRAGBot:
             .build()
         )
 
-        # Команды
+        # Команды Telegram.
         self.application.add_handler(
             CommandHandler("start", self.start_command)
         )
@@ -96,12 +97,90 @@ class TelegramRAGBot:
             CommandHandler("logs", self.logs_command)
         )
 
-        # Обычные текстовые сообщения
+        # Обычные текстовые сообщения.
         self.application.add_handler(
             MessageHandler(
                 filters.TEXT & ~filters.COMMAND,
                 self.handle_message,
             )
+        )
+
+        # Общий обработчик необработанных ошибок.
+        self.application.add_error_handler(self.error_handler)
+
+    async def _retry_telegram_call(
+        self,
+        operation,
+        operation_name: str,
+        retries: int = 3,
+    ):
+        """
+        Повторяет Telegram API-вызов при временной сетевой ошибке.
+
+        Задержки между попытками: 1, 2 секунды.
+        Повторная отправка после сетевого обрыва теоретически может
+        привести к дубликату, если Telegram принял сообщение,
+        но клиент не получил подтверждение.
+        """
+        for attempt in range(retries):
+            try:
+                return await operation()
+
+            except NetworkError:
+                if attempt == retries - 1:
+                    logger.exception(
+                        "Не удалось выполнить операцию '%s' после %s попыток",
+                        operation_name,
+                        retries,
+                    )
+                    raise
+
+                delay = 2 ** attempt
+                logger.warning(
+                    "Сетевая ошибка Telegram при операции '%s'. "
+                    "Повтор через %s сек. Попытка %s/%s",
+                    operation_name,
+                    delay,
+                    attempt + 1,
+                    retries,
+                )
+                await asyncio.sleep(delay)
+
+    async def _safe_reply(
+        self,
+        message,
+        text: str,
+        retries: int = 3,
+        **kwargs,
+    ):
+        """Отправляет текстовое сообщение с повторными попытками."""
+        return await self._retry_telegram_call(
+            operation=lambda: message.reply_text(text, **kwargs),
+            operation_name="отправка текстового сообщения",
+            retries=retries,
+        )
+
+    async def _safe_reply_document(
+        self,
+        message,
+        filename: str,
+        caption: str = None,
+        retries: int = 3,
+    ):
+        """Отправляет документ; файл заново открывается для каждой попытки."""
+
+        async def send_document():
+            with open(filename, "rb") as file:
+                return await message.reply_document(
+                    document=file,
+                    filename=os.path.basename(filename),
+                    caption=caption,
+                )
+
+        return await self._retry_telegram_call(
+            operation=send_document,
+            operation_name="отправка документа",
+            retries=retries,
         )
 
     async def start_command(
@@ -125,7 +204,10 @@ class TelegramRAGBot:
 
 Просто напишите мне вопрос!
 """
-        await update.message.reply_text(welcome_message.strip())
+        await self._safe_reply(
+            update.message,
+            welcome_message.strip(),
+        )
 
     async def help_command(
         self,
@@ -154,7 +236,10 @@ class TelegramRAGBot:
 • Расскажи про RAG.
 • Что такое векторные базы данных?
 """
-        await update.message.reply_text(help_text.strip())
+        await self._safe_reply(
+            update.message,
+            help_text.strip(),
+        )
 
     async def stats_command(
         self,
@@ -187,7 +272,10 @@ class TelegramRAGBot:
 • Уникальных пользователей: {log_stats['unique_users']}
 • Среднее время ответа: {log_stats['avg_response_time_ms']:.0f} мс
 """
-            await update.message.reply_text(stats_message.strip())
+            await self._safe_reply(
+                update.message,
+                stats_message.strip(),
+            )
 
         except Exception:
             logger.exception("Ошибка при получении статистики")
@@ -212,8 +300,9 @@ class TelegramRAGBot:
             csv_content = self.db_logger.export_to_csv(user_id=user_id)
 
             if not csv_content:
-                await update.message.reply_text(
-                    "📝 Логов для вашего пользователя не найдено."
+                await self._safe_reply(
+                    update.message,
+                    "📝 Логов для вашего пользователя не найдено.",
                 )
                 return
 
@@ -222,12 +311,11 @@ class TelegramRAGBot:
             with open(filename, "w", encoding="utf-8-sig", newline="") as file:
                 file.write(csv_content)
 
-            with open(filename, "rb") as file:
-                await update.message.reply_document(
-                    document=file,
-                    filename=filename,
-                    caption="📊 Ваши логи взаимодействий с ботом",
-                )
+            await self._safe_reply_document(
+                update.message,
+                filename=filename,
+                caption="📊 Ваши логи взаимодействий с ботом",
+            )
 
         except Exception:
             logger.exception("Ошибка при экспорте логов")
@@ -262,7 +350,15 @@ class TelegramRAGBot:
         start_time = time.time()
 
         try:
-            await update.message.chat.send_action(action="typing")
+            # Индикатор набора текста. Если он временно не отправился,
+            # продолжаем обработку вопроса.
+            try:
+                await update.message.chat.send_action(action="typing")
+            except NetworkError:
+                logger.warning(
+                    "Не удалось отправить индикатор typing; "
+                    "обработка вопроса продолжается."
+                )
 
             # Проверяем кеш.
             cached_answer = self.cache.get(user_message)
@@ -292,6 +388,7 @@ class TelegramRAGBot:
             )
 
             # Telegram ограничивает длину текстового сообщения.
+            # Оставляем запас относительно предельной длины.
             max_length = 4000
             parts = [
                 answer[i:i + max_length]
@@ -299,10 +396,11 @@ class TelegramRAGBot:
             ]
 
             for part in parts:
-                await update.message.reply_text(part)
+                await self._safe_reply(update.message, part)
 
             if from_cache:
-                await update.message.reply_text(
+                await self._safe_reply(
+                    update.message,
                     "💾 Ответ получен из кеша.",
                     do_quote=False,
                 )
@@ -339,11 +437,19 @@ class TelegramRAGBot:
             return
 
         try:
-            await update.effective_message.reply_text(message)
+            await self._safe_reply(update.effective_message, message)
         except TelegramError:
             logger.exception(
                 "Не удалось отправить сообщение об ошибке в Telegram"
             )
+
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+        """Обрабатывает ошибки, не перехваченные отдельными обработчиками."""
+        logger.error(
+            "Необработанная ошибка при обработке обновления: %s",
+            context.error,
+            exc_info=context.error,
+        )
 
     def run(self):
         """Запускает бота."""
